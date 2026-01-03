@@ -61,10 +61,7 @@ static bool hookVanillaCameraAPI() {
         uintptr_t s, e;
         if (!parseMapsLine(line, s, e)) continue;
         for (uintptr_t p = s; p < e - RTTI_LEN; ++p) {
-            if (!memcmp((void*)p, RTTI, RTTI_LEN)) {
-                rtti = p;
-                break;
-            }
+            if (!memcmp((void*)p, RTTI, RTTI_LEN)) { rtti = p; break; }
         }
         if (rtti) break;
     }
@@ -78,10 +75,7 @@ static bool hookVanillaCameraAPI() {
         uintptr_t s, e;
         if (!parseMapsLine(line, s, e)) continue;
         for (uintptr_t p = s; p < e; p += sizeof(void*)) {
-            if (*(uintptr_t*)p == rtti) {
-                typeinfo = p - sizeof(void*);
-                break;
-            }
+            if (*(uintptr_t*)p == rtti) { typeinfo = p - sizeof(void*); break; }
         }
         if (typeinfo) break;
     }
@@ -95,10 +89,7 @@ static bool hookVanillaCameraAPI() {
         uintptr_t s, e;
         if (!parseMapsLine(line, s, e)) continue;
         for (uintptr_t p = s; p < e; p += sizeof(void*)) {
-            if (*(uintptr_t*)p == typeinfo) {
-                vtable = p + sizeof(void*);
-                break;
-            }
+            if (*(uintptr_t*)p == typeinfo) { vtable = p + sizeof(void*); break; }
         }
         if (vtable) break;
     }
@@ -107,7 +98,6 @@ static bool hookVanillaCameraAPI() {
 
     void** slot = (void**)(vtable + 2 * sizeof(void*));
     g_tryGetDamageBob_orig = (decltype(g_tryGetDamageBob_orig))(*slot);
-    if (!g_tryGetDamageBob_orig) return false;
 
     uintptr_t page = (uintptr_t)slot & ~4095UL;
     mprotect((void*)page, 4096, PROT_READ | PROT_WRITE);
@@ -118,49 +108,55 @@ static bool hookVanillaCameraAPI() {
     return true;
 }
 
-static bool g_Initialized = false;
-static int g_Width = 0, g_Height = 0;
-static EGLContext g_TargetContext = EGL_NO_CONTEXT;
-static EGLSurface g_TargetSurface = EGL_NO_SURFACE;
+static bool g_imguiInit = false;
+static EGLContext g_ctx = EGL_NO_CONTEXT;
+static EGLSurface g_surf = EGL_NO_SURFACE;
+static int g_w = 0, g_h = 0;
 
 static EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
 static void (*orig_Input1)(void*, void*, void*) = nullptr;
 static int32_t (*orig_Input2)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
 
-static void hook_Input1(void* thiz, void* a1, void* a2) {
-    if (g_Initialized && a2)
-        ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)a2);
-    if (orig_Input1) orig_Input1(thiz, a1, a2);
+static void hook_Input1(void* t, void* a1, void* a2) {
+    if (g_imguiInit && a2) ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)a2);
+    if (orig_Input1) orig_Input1(t, a1, a2);
 }
 
-static int32_t hook_Input2(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, AInputEvent** event) {
-    int32_t r = orig_Input2 ? orig_Input2(thiz, a1, a2, a3, a4, event) : 0;
-    if (g_Initialized && event && *event)
-        ImGui_ImplAndroid_HandleInputEvent(*event);
+static int32_t hook_Input2(void* t, void* a1, bool a2, long a3, uint32_t* a4, AInputEvent** ev) {
+    int32_t r = orig_Input2 ? orig_Input2(t, a1, a2, a3, a4, ev) : 0;
+    if (g_imguiInit && ev && *ev) ImGui_ImplAndroid_HandleInputEvent(*ev);
     return r;
 }
 
-static void Setup() {
-    if (g_Initialized || g_Width <= 0 || g_Height <= 0) return;
+static void SetupImGui() {
+    if (g_imguiInit) return;
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
+    io.FontGlobalScale = 2.2f;
+    ImGui::StyleColorsDark();
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.ScaleAllSizes(2.0f);
     ImGui_ImplAndroid_Init();
     ImGui_ImplOpenGL3_Init("#version 300 es");
-    g_Initialized = true;
+    g_imguiInit = true;
 }
 
 static void DrawMenu() {
-    ImGui::Begin("Menu", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-    ImGui::Checkbox("No Hurt Cam", &g_enabled);
+    ImGui::SetNextWindowSize(ImVec2(700, 450), ImGuiCond_Always);
+    ImGui::Begin("NoHurtCam Menu", nullptr,
+        ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoResize);
+    ImGui::Checkbox("No Hurt Camera", &g_enabled);
     ImGui::End();
 }
 
-static void Render() {
+static void RenderImGui() {
     ImGuiIO& io = ImGui::GetIO();
-    io.DisplaySize = ImVec2((float)g_Width, (float)g_Height);
+    io.DisplaySize = ImVec2((float)g_w, (float)g_h);
     ImGui_ImplOpenGL3_NewFrame();
-    ImGui_ImplAndroid_NewFrame(g_Width, g_Height);
+    ImGui_ImplAndroid_NewFrame(g_w, g_h);
     ImGui::NewFrame();
     DrawMenu();
     ImGui::Render();
@@ -176,22 +172,20 @@ static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
     EGLint w, h;
     eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
     eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
-    if (w < 500 || h < 500) return orig_eglSwapBuffers(dpy, surf);
 
-    if (g_TargetContext == EGL_NO_CONTEXT) {
-        g_TargetContext = ctx;
-        g_TargetSurface = surf;
+    g_w = w;
+    g_h = h;
+
+    if (g_ctx == EGL_NO_CONTEXT) {
+        g_ctx = ctx;
+        g_surf = surf;
     }
 
-    if (ctx != g_TargetContext || surf != g_TargetSurface)
-        return orig_eglSwapBuffers(dpy, surf);
-
-    g_Width = w;
-    g_Height = h;
-
-    hookVanillaCameraAPI();
-    Setup();
-    Render();
+    if (ctx == g_ctx && surf == g_surf) {
+        hookVanillaCameraAPI();
+        SetupImGui();
+        RenderImGui();
+    }
 
     return orig_eglSwapBuffers(dpy, surf);
 }
