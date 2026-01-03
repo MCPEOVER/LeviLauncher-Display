@@ -40,6 +40,9 @@ static char options_buffer[16384];
 static bool options_loaded = false;
 static bool options_dirty = false;
 
+static bool vk_open = false;
+static int vk_target_cursor = 0;
+
 static void load_options_file() {
     std::ifstream f(OPTIONS_PATH);
     if (!f.is_open()) {
@@ -64,17 +67,13 @@ static void save_options_file() {
 static void (*orig_input1)(void*, void*, void*) = nullptr;
 static void hook_input1(void* thiz, void* a1, void* a2) {
     if (orig_input1) orig_input1(thiz, a1, a2);
-    if (thiz && g_initialized) {
-        ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz);
-    }
+    if (thiz && g_initialized) ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz);
 }
 
 static int32_t (*orig_input2)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
 static int32_t hook_input2(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, AInputEvent** event) {
     int32_t result = orig_input2 ? orig_input2(thiz, a1, a2, a3, a4, event) : 0;
-    if (result == 0 && event && *event && g_initialized) {
-        ImGui_ImplAndroid_HandleInputEvent(*event);
-    }
+    if (result == 0 && event && *event && g_initialized) ImGui_ImplAndroid_HandleInputEvent(*event);
     return result;
 }
 
@@ -126,37 +125,80 @@ static void draw_tab_crosshair() {
     ImGui::ColorEdit4("Color", (float*)&crosshair_color);
 }
 
+static void vk_insert(const char* s) {
+    std::string cur = options_buffer;
+    cur.insert(vk_target_cursor, s);
+    memset(options_buffer, 0, sizeof(options_buffer));
+    strncpy(options_buffer, cur.c_str(), sizeof(options_buffer) - 1);
+    vk_target_cursor += strlen(s);
+    options_dirty = true;
+}
+
+static void draw_virtual_keyboard() {
+    if (!vk_open) return;
+    ImGui::SetNextWindowSize(ImVec2(520, 220), ImGuiCond_Always);
+    ImGui::Begin("Keyboard", &vk_open, ImGuiWindowFlags_NoCollapse);
+    const char* row1 = "1234567890-=";
+    const char* row2 = "qwertyuiop[]";
+    const char* row3 = "asdfghjkl;'\\";
+    const char* row4 = "zxcvbnm,./";
+    auto draw_row = [&](const char* r){
+        for (int i = 0; r[i]; ++i) {
+            std::string label; label += r[i];
+            if (ImGui::Button(label.c_str(), ImVec2(32,32))) vk_insert(label.c_str());
+            ImGui::SameLine();
+        }
+        ImGui::NewLine();
+    };
+    draw_row(row1);
+    draw_row(row2);
+    draw_row(row3);
+    draw_row(row4);
+    if (ImGui::Button("Space", ImVec2(200,32))) vk_insert(" ");
+    ImGui::SameLine();
+    if (ImGui::Button("Enter", ImVec2(100,32))) vk_insert("\n");
+    ImGui::SameLine();
+    if (ImGui::Button("Backspace", ImVec2(120,32))) {
+        std::string cur = options_buffer;
+        if (vk_target_cursor > 0 && vk_target_cursor <= (int)cur.size()) {
+            cur.erase(vk_target_cursor-1,1);
+            vk_target_cursor--;
+            memset(options_buffer,0,sizeof(options_buffer));
+            strncpy(options_buffer,cur.c_str(),sizeof(options_buffer)-1);
+            options_dirty = true;
+        }
+    }
+    ImGui::End();
+}
+
 static void draw_tab_options() {
     if (!options_loaded) load_options_file();
     ImGui::Text("options.txt Editor");
     ImGui::Separator();
-    if (ImGui::InputTextMultiline("##opts", options_buffer, sizeof(options_buffer), ImVec2(450, 350))) {
-        options_dirty = true;
-    }
-    if (ImGui::Button("Save")) {
-        save_options_file();
-    }
+    ImGuiInputTextFlags flags = ImGuiInputTextFlags_CallbackAlways;
+    if (ImGui::InputTextMultiline("##opts", options_buffer, sizeof(options_buffer), ImVec2(-1, 360), flags, [](ImGuiInputTextCallbackData* data){
+        vk_target_cursor = data->CursorPos;
+        return 0;
+    })) options_dirty = true;
+    if (ImGui::Button("Save")) save_options_file();
     ImGui::SameLine();
-    if (ImGui::Button("Reload")) {
-        load_options_file();
-    }
+    if (ImGui::Button("Reload")) load_options_file();
+    ImGui::SameLine();
+    if (ImGui::Button(vk_open ? "Close Keyboard" : "Open Keyboard")) vk_open = !vk_open;
     if (options_dirty) ImGui::TextColored(ImVec4(1,0.2f,0.2f,1),"Unsaved changes");
+    draw_virtual_keyboard();
 }
 
 static void drawmenu() {
     ImGui::SetNextWindowPos(ImVec2(10, 80), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(520, 520), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Editor", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-
+    ImGui::SetNextWindowSize(ImVec2(560, 560), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Levi Launcher Imgui Demo", nullptr);
     if (ImGui::Button(current_tab == 0 ? "[ Crosshair ]" : "Crosshair")) current_tab = 0;
     ImGui::SameLine();
     if (ImGui::Button(current_tab == 1 ? "[ Options Editor ]" : "Options Editor")) current_tab = 1;
-
     ImGui::Separator();
-
     if (current_tab == 0) draw_tab_crosshair();
     else draw_tab_options();
-
     ImGui::End();
 }
 
@@ -211,8 +253,7 @@ static void hookinput() {
     void* sym = (void*)GlossSymbol(GlossOpen("libinput.so"),
         "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE",
         nullptr);
-    if (sym)
-        GlossHook(sym, (void*)hook_input2, (void**)&orig_input2);
+    if (sym) GlossHook(sym, (void*)hook_input2, (void**)&orig_input2);
 }
 
 static void* mainthread(void*) {
