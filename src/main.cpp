@@ -1,4 +1,5 @@
 #include <jni.h>
+#include <android/log.h>
 #include <android/input.h>
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
@@ -13,163 +14,235 @@
 #include "ImGui/backends/imgui_impl_opengl3.h"
 #include "ImGui/backends/imgui_impl_android.h"
 
-static bool g_Initialized = false;
-static int g_Width = 0, g_Height = 0;
-static EGLContext g_TargetContext = EGL_NO_CONTEXT;
-static EGLSurface g_TargetSurface = EGL_NO_SURFACE;
+#include <chrono>
+#include <mutex>
 
-static EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
+/* ==============================
+   Global State
+================================ */
 
-static void (*orig_Input1)(void*, void*, void*) = nullptr;
-static void hook_Input1(void* thiz, void* a1, void* a2) {
-    if (orig_Input1) orig_Input1(thiz, a1, a2);
-    if (thiz && g_Initialized) ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz);
+static bool g_initialized = false;
+static int g_width = 0, g_height = 0;
+static EGLContext g_targetcontext = EGL_NO_CONTEXT;
+static EGLSurface g_targetsurface = EGL_NO_SURFACE;
+
+static EGLBoolean (*orig_eglswapbuffers)(EGLDisplay, EGLSurface) = nullptr;
+
+/* ==============================
+   Crosshair Config
+================================ */
+
+static bool crosshair_enabled = false;
+static float crosshair_length_x = 20.0f;
+static float crosshair_length_y = 20.0f;
+static float crosshair_thickness = 2.0f;
+static ImVec4 crosshair_color = ImVec4(1.f, 0.f, 0.f, 1.f);
+
+/* ==============================
+   Input Hook
+================================ */
+
+static void (*orig_input1)(void*, void*, void*) = nullptr;
+static void hook_input1(void* thiz, void* a1, void* a2) {
+    if (orig_input1) orig_input1(thiz, a1, a2);
+    if (thiz && g_initialized) {
+        ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz);
+    }
 }
 
-static int32_t (*orig_Input2)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
-static int32_t hook_Input2(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, AInputEvent** event) {
-    int32_t result = orig_Input2 ? orig_Input2(thiz, a1, a2, a3, a4, event) : 0;
-    if (result == 0 && event && *event && g_Initialized) {
+static int32_t (*orig_input2)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
+static int32_t hook_input2(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, AInputEvent** event) {
+    int32_t result = orig_input2 ? orig_input2(thiz, a1, a2, a3, a4, event) : 0;
+    if (result == 0 && event && *event && g_initialized) {
         ImGui_ImplAndroid_HandleInputEvent(*event);
     }
     return result;
 }
 
-struct GLState {
-    GLint prog, tex, aTex, aBuf, eBuf, vao, fbo, vp[4], sc[4], bSrc, bDst;
-    GLboolean blend, cull, depth, scissor;
+/* ==============================
+   GL State Backup
+================================ */
+
+struct glstate {
+    GLint prog, tex, abuf, ebuf, vao, fbo, vp[4];
+    GLboolean blend, depth, scissor;
 };
 
-static void SaveGL(GLState& s) {
+static void savegl(glstate& s) {
     glGetIntegerv(GL_CURRENT_PROGRAM, &s.prog);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &s.tex);
-    glGetIntegerv(GL_ACTIVE_TEXTURE, &s.aTex);
-    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &s.aBuf);
-    glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &s.eBuf);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &s.abuf);
+    glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &s.ebuf);
     glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &s.vao);
     glGetIntegerv(GL_FRAMEBUFFER_BINDING, &s.fbo);
     glGetIntegerv(GL_VIEWPORT, s.vp);
-    glGetIntegerv(GL_SCISSOR_BOX, s.sc);
-    glGetIntegerv(GL_BLEND_SRC_ALPHA, &s.bSrc);
-    glGetIntegerv(GL_BLEND_DST_ALPHA, &s.bDst);
     s.blend = glIsEnabled(GL_BLEND);
-    s.cull = glIsEnabled(GL_CULL_FACE);
     s.depth = glIsEnabled(GL_DEPTH_TEST);
     s.scissor = glIsEnabled(GL_SCISSOR_TEST);
 }
 
-static void RestoreGL(const GLState& s) {
+static void restoregl(const glstate& s) {
     glUseProgram(s.prog);
-    glActiveTexture(s.aTex);
     glBindTexture(GL_TEXTURE_2D, s.tex);
-    glBindBuffer(GL_ARRAY_BUFFER, s.aBuf);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s.eBuf);
+    glBindBuffer(GL_ARRAY_BUFFER, s.abuf);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s.ebuf);
     glBindVertexArray(s.vao);
     glBindFramebuffer(GL_FRAMEBUFFER, s.fbo);
     glViewport(s.vp[0], s.vp[1], s.vp[2], s.vp[3]);
-    glScissor(s.sc[0], s.sc[1], s.sc[2], s.sc[3]);
-    glBlendFunc(s.bSrc, s.bDst);
     s.blend ? glEnable(GL_BLEND) : glDisable(GL_BLEND);
-    s.cull ? glEnable(GL_CULL_FACE) : glDisable(GL_CULL_FACE);
     s.depth ? glEnable(GL_DEPTH_TEST) : glDisable(GL_DEPTH_TEST);
     s.scissor ? glEnable(GL_SCISSOR_TEST) : glDisable(GL_SCISSOR_TEST);
 }
 
-static void DrawMenu() {
-    ImGuiIO& io = ImGui::GetIO();
-    ImGui::SetNextWindowSize(ImVec2(200, 0), ImGuiCond_FirstUseEver);
-    ImGui::Begin("FPS", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize);
-    ImGui::Text("%.1f FPS", io.Framerate);
+/* ==============================
+   Draw Crosshair
+================================ */
+
+static void draw_crosshair() {
+    if (!crosshair_enabled) return;
+
+    ImDrawList* draw = ImGui::GetBackgroundDrawList();
+    ImVec2 center(g_width * 0.5f, g_height * 0.5f);
+    ImU32 col = ImGui::ColorConvertFloat4ToU32(crosshair_color);
+
+    draw->AddLine(
+        ImVec2(center.x - crosshair_length_x, center.y),
+        ImVec2(center.x + crosshair_length_x, center.y),
+        col,
+        crosshair_thickness
+    );
+
+    draw->AddLine(
+        ImVec2(center.x, center.y - crosshair_length_y),
+        ImVec2(center.x, center.y + crosshair_length_y),
+        col,
+        crosshair_thickness
+    );
+}
+
+/* ==============================
+   Menu
+================================ */
+
+static void drawmenu() {
+    ImGui::SetNextWindowPos(ImVec2(10, 100), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Crosshair", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+
+    ImGui::Checkbox("Enable Crosshair", &crosshair_enabled);
+    ImGui::SliderFloat("Length X", &crosshair_length_x, 5.f, 100.f);
+    ImGui::SliderFloat("Length Y", &crosshair_length_y, 5.f, 100.f);
+    ImGui::SliderFloat("Thickness", &crosshair_thickness, 1.f, 6.f);
+    ImGui::ColorEdit4("Color", (float*)&crosshair_color);
+
     ImGui::End();
 }
 
-static void Setup() {
-    if (g_Initialized || g_Width <= 0 || g_Height <= 0) return;
+/* ==============================
+   ImGui Setup
+================================ */
+
+static void setup() {
+    if (g_initialized || g_width <= 0 || g_height <= 0) return;
+
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
-    float scale = (float)g_Height / 720.0f;
-    if (scale < 1.5f) scale = 1.5f;
-    if (scale > 4.0f) scale = 4.0f;
-    ImFontConfig cfg;
-    cfg.SizePixels = 32.0f * scale;
-    io.Fonts->AddFontDefault(&cfg);
+
     ImGui_ImplAndroid_Init();
     ImGui_ImplOpenGL3_Init("#version 300 es");
-    ImGui::GetStyle().ScaleAllSizes(scale);
-    g_Initialized = true;
+
+    g_initialized = true;
 }
 
-static void Render() {
-    if (!g_Initialized) return;
-    GLState s;
-    SaveGL(s);
+/* ==============================
+   Render
+================================ */
+
+static void render() {
+    if (!g_initialized) return;
+
+    glstate s;
+    savegl(s);
+
     ImGuiIO& io = ImGui::GetIO();
-    io.DisplaySize = ImVec2((float)g_Width, (float)g_Height);
+    io.DisplaySize = ImVec2((float)g_width, (float)g_height);
+
     ImGui_ImplOpenGL3_NewFrame();
-    ImGui_ImplAndroid_NewFrame(g_Width, g_Height);
+    ImGui_ImplAndroid_NewFrame(g_width, g_height);
     ImGui::NewFrame();
-    DrawMenu();
+
+    drawmenu();
+    draw_crosshair();
+
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-    RestoreGL(s);
+
+    restoregl(s);
 }
 
-static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
-    if (!orig_eglSwapBuffers) return EGL_FALSE;
+/* ==============================
+   EGL Hook
+================================ */
+
+static EGLBoolean hook_eglswapbuffers(EGLDisplay dpy, EGLSurface surf) {
+    if (!orig_eglswapbuffers) return EGL_FALSE;
+
     EGLContext ctx = eglGetCurrentContext();
-    if (ctx == EGL_NO_CONTEXT) return orig_eglSwapBuffers(dpy, surf);
+    if (ctx == EGL_NO_CONTEXT) return orig_eglswapbuffers(dpy, surf);
+
     EGLint w = 0, h = 0;
     eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
     eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
-    if (w < 500 || h < 500) return orig_eglSwapBuffers(dpy, surf);
-    if (g_TargetContext == EGL_NO_CONTEXT) {
-        EGLint buf = 0;
-        eglQuerySurface(dpy, surf, EGL_RENDER_BUFFER, &buf);
-        if (buf == EGL_BACK_BUFFER) {
-            g_TargetContext = ctx;
-            g_TargetSurface = surf;
-        }
+
+    if (w < 500 || h < 500) return orig_eglswapbuffers(dpy, surf);
+
+    if (g_targetcontext == EGL_NO_CONTEXT) {
+        g_targetcontext = ctx;
+        g_targetsurface = surf;
     }
-    if (ctx != g_TargetContext || surf != g_TargetSurface)
-        return orig_eglSwapBuffers(dpy, surf);
-    g_Width = w;
-    g_Height = h;
-    Setup();
-    Render();
-    return orig_eglSwapBuffers(dpy, surf);
+
+    if (ctx != g_targetcontext || surf != g_targetsurface)
+        return orig_eglswapbuffers(dpy, surf);
+
+    g_width = w;
+    g_height = h;
+
+    setup();
+    render();
+
+    return orig_eglswapbuffers(dpy, surf);
 }
 
-static void HookInput() {
-    void* sym1 = (void*)GlossSymbol(GlossOpen("libinput.so"),
-        "_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE", nullptr);
-    if (sym1) {
-        GHook h = GlossHook(sym1, (void*)hook_Input1, (void**)&orig_Input1);
-        if (h) return;
-    }
-    void* sym2 = (void*)GlossSymbol(GlossOpen("libinput.so"),
-        "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE", nullptr);
-    if (sym2) {
-        GHook h = GlossHook(sym2, (void*)hook_Input2, (void**)&orig_Input2);
-        if (h) return;
-    }
+/* ==============================
+   Init Thread
+================================ */
+
+static void hookinput() {
+    void* sym = (void*)GlossSymbol(GlossOpen("libinput.so"),
+        "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE",
+        nullptr);
+
+    if (sym)
+        GlossHook(sym, (void*)hook_input2, (void**)&orig_input2);
 }
 
-static void* MainThread(void*) {
+static void* mainthread(void*) {
     sleep(3);
     GlossInit(true);
-    GHandle hEGL = GlossOpen("libEGL.so");
-    if (!hEGL) return nullptr;
-    void* swap = (void*)GlossSymbol(hEGL, "eglSwapBuffers", nullptr);
+
+    GHandle hegl = GlossOpen("libEGL.so");
+    if (!hegl) return nullptr;
+
+    void* swap = (void*)GlossSymbol(hegl, "eglSwapBuffers", nullptr);
     if (!swap) return nullptr;
-    GHook h = GlossHook(swap, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
-    if (!h) return nullptr;
-    HookInput();
+
+    GlossHook(swap, (void*)hook_eglswapbuffers, (void**)&orig_eglswapbuffers);
+    hookinput();
     return nullptr;
 }
 
 __attribute__((constructor))
-void DisplayFPS_Init() {
+void display_init() {
     pthread_t t;
-    pthread_create(&t, nullptr, MainThread, nullptr);
+    pthread_create(&t, nullptr, mainthread, nullptr);
 }
