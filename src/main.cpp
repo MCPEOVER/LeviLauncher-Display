@@ -6,10 +6,6 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <dlfcn.h>
-#include <chrono>
-#include <mutex>
-#include <fstream>
-#include <sstream>
 
 #include "pl/Hook.h"
 #include "pl/Gloss.h"
@@ -18,35 +14,67 @@
 #include "ImGui/backends/imgui_impl_opengl3.h"
 #include "ImGui/backends/imgui_impl_android.h"
 
+#include <chrono>
+#include <mutex>
+#include <fstream>
+#include <sstream>
+#include <string>
+
 static bool g_initialized = false;
 static int g_width = 0, g_height = 0;
 static EGLContext g_targetcontext = EGL_NO_CONTEXT;
 static EGLSurface g_targetsurface = EGL_NO_SURFACE;
+
 static EGLBoolean (*orig_eglswapbuffers)(EGLDisplay, EGLSurface) = nullptr;
 
 static bool crosshair_enabled = false;
-static float crosshair_length_x = 20.0f;
-static float crosshair_length_y = 20.0f;
-static float crosshair_thickness = 2.0f;
-static ImVec4 crosshair_color = ImVec4(1.f, 0.f, 0.f, 1.f);
+static float crosshair_length_x = 35.0f;
+static float crosshair_length_y = 35.0f;
+static float crosshair_thickness = 3.0f;
+static ImVec4 crosshair_color = ImVec4(0.f, 1.f, 0.f, 1.f);
 
-static int menu_tab = 0;
+static int current_tab = 0;
 
-static std::string options_buffer;
+static const char* OPTIONS_PATH = "/storage/emulated/0/Android/data/org.levimc.launcher/files/games/com.mojang/minecraftpe/options.txt";
+static char options_buffer[16384];
 static bool options_loaded = false;
 static bool options_dirty = false;
 
-static void (*orig_input1)(void*, void*, void*) = nullptr;
-static int32_t (*orig_input2)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
-
-static void hook_input1(void* thiz, void* a1, void* a2) {
-    if (orig_input1) orig_input1(thiz, a1, a2);
-    if (thiz && g_initialized) ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz);
+static void load_options_file() {
+    std::ifstream f(OPTIONS_PATH);
+    if (!f.is_open()) {
+        options_buffer[0] = 0;
+        return;
+    }
+    std::stringstream ss;
+    ss << f.rdbuf();
+    std::string txt = ss.str();
+    memset(options_buffer, 0, sizeof(options_buffer));
+    strncpy(options_buffer, txt.c_str(), sizeof(options_buffer) - 1);
+    options_loaded = true;
 }
 
+static void save_options_file() {
+    std::ofstream f(OPTIONS_PATH, std::ios::trunc);
+    if (!f.is_open()) return;
+    f << options_buffer;
+    options_dirty = false;
+}
+
+static void (*orig_input1)(void*, void*, void*) = nullptr;
+static void hook_input1(void* thiz, void* a1, void* a2) {
+    if (orig_input1) orig_input1(thiz, a1, a2);
+    if (thiz && g_initialized) {
+        ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz);
+    }
+}
+
+static int32_t (*orig_input2)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
 static int32_t hook_input2(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, AInputEvent** event) {
     int32_t result = orig_input2 ? orig_input2(thiz, a1, a2, a3, a4, event) : 0;
-    if (result == 0 && event && *event && g_initialized) ImGui_ImplAndroid_HandleInputEvent(*event);
+    if (result == 0 && event && *event && g_initialized) {
+        ImGui_ImplAndroid_HandleInputEvent(*event);
+    }
     return result;
 }
 
@@ -81,33 +109,13 @@ static void restoregl(const glstate& s) {
     s.scissor ? glEnable(GL_SCISSOR_TEST) : glDisable(GL_SCISSOR_TEST);
 }
 
-static void draw_crosshair() {
+static void draw_crosshair_overlay() {
     if (!crosshair_enabled) return;
     ImDrawList* draw = ImGui::GetBackgroundDrawList();
     ImVec2 center(g_width * 0.5f, g_height * 0.5f);
     ImU32 col = ImGui::ColorConvertFloat4ToU32(crosshair_color);
     draw->AddLine(ImVec2(center.x - crosshair_length_x, center.y), ImVec2(center.x + crosshair_length_x, center.y), col, crosshair_thickness);
     draw->AddLine(ImVec2(center.x, center.y - crosshair_length_y), ImVec2(center.x, center.y + crosshair_length_y), col, crosshair_thickness);
-}
-
-static void load_options_file() {
-    if (options_loaded) return;
-    std::ifstream f("/storage/emulated/0/Android/data/org.levimc.launcher/files/games/com.mojang/minecraftpe/options.txt");
-    if (f.good()) {
-        std::stringstream ss;
-        ss << f.rdbuf();
-        options_buffer = ss.str();
-        options_loaded = true;
-    }
-}
-
-static void save_options_file() {
-    if (!options_loaded) return;
-    std::ofstream f("/storage/emulated/0/Android/data/org.levimc.launcher/files/games/com.mojang/minecraftpe/options.txt", std::ios::trunc);
-    if (f.good()) {
-        f << options_buffer;
-        options_dirty = false;
-    }
 }
 
 static void draw_tab_crosshair() {
@@ -120,22 +128,35 @@ static void draw_tab_crosshair() {
 
 static void draw_tab_options() {
     if (!options_loaded) load_options_file();
-    ImGui::TextUnformatted("options.txt");
+    ImGui::Text("options.txt Editor");
     ImGui::Separator();
-    if (ImGui::InputTextMultiline("##options", &options_buffer, ImVec2(-1, ImGui::GetTextLineHeight() * 20))) options_dirty = true;
-    if (ImGui::Button("Save") && options_dirty) save_options_file();
+    if (ImGui::InputTextMultiline("##opts", options_buffer, sizeof(options_buffer), ImVec2(450, 350))) {
+        options_dirty = true;
+    }
+    if (ImGui::Button("Save")) {
+        save_options_file();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reload")) {
+        load_options_file();
+    }
+    if (options_dirty) ImGui::TextColored(ImVec4(1,0.2f,0.2f,1),"Unsaved changes");
 }
 
 static void drawmenu() {
-    ImGui::SetNextWindowPos(ImVec2(20, 80), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(420, 420), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(10, 80), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(520, 520), ImGuiCond_FirstUseEver);
     ImGui::Begin("Editor", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
-    if (ImGui::Button(menu_tab == 0 ? "> Crosshair <" : "Crosshair")) menu_tab = 0;
+
+    if (ImGui::Button(current_tab == 0 ? "[ Crosshair ]" : "Crosshair")) current_tab = 0;
     ImGui::SameLine();
-    if (ImGui::Button(menu_tab == 1 ? "> Options Editor <" : "Options Editor")) menu_tab = 1;
+    if (ImGui::Button(current_tab == 1 ? "[ Options Editor ]" : "Options Editor")) current_tab = 1;
+
     ImGui::Separator();
-    if (menu_tab == 0) draw_tab_crosshair();
+
+    if (current_tab == 0) draw_tab_crosshair();
     else draw_tab_options();
+
     ImGui::End();
 }
 
@@ -159,7 +180,7 @@ static void render() {
     ImGui_ImplAndroid_NewFrame(g_width, g_height);
     ImGui::NewFrame();
     drawmenu();
-    draw_crosshair();
+    draw_crosshair_overlay();
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
     restoregl(s);
@@ -177,7 +198,8 @@ static EGLBoolean hook_eglswapbuffers(EGLDisplay dpy, EGLSurface surf) {
         g_targetcontext = ctx;
         g_targetsurface = surf;
     }
-    if (ctx != g_targetcontext || surf != g_targetsurface) return orig_eglswapbuffers(dpy, surf);
+    if (ctx != g_targetcontext || surf != g_targetsurface)
+        return orig_eglswapbuffers(dpy, surf);
     g_width = w;
     g_height = h;
     setup();
@@ -189,7 +211,8 @@ static void hookinput() {
     void* sym = (void*)GlossSymbol(GlossOpen("libinput.so"),
         "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE",
         nullptr);
-    if (sym) GlossHook(sym, (void*)hook_input2, (void**)&orig_input2);
+    if (sym)
+        GlossHook(sym, (void*)hook_input2, (void**)&orig_input2);
 }
 
 static void* mainthread(void*) {
