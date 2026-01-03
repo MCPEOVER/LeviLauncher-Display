@@ -11,6 +11,8 @@ A customizable crosshair mod for Minecraft Bedrock (Android).
 
 > ✔ Fully customizable
 
+> This mod is a fork based on work by [RadiantByte](https://github.com/RadiantByte).
+
 ## ⭐ Features
 
 • Enable / Disable crosshair
